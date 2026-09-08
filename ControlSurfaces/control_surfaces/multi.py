@@ -27,6 +27,7 @@ import time
 from typing import Callable, Iterator
 
 from .surface import ControlSurface, Event
+from .events import ConnectionEvent, SurfaceErrorEvent
 
 DEVICE_ATTR = 'device_type'   # attribute name added to every event
 
@@ -74,6 +75,8 @@ class MultiSurface:
         self._dial_cbs:     list[Callable] = []
         self._tbar_cbs:     list[Callable] = []
         self._joystick_cbs: list[Callable] = []
+        self._connection_cbs: list[Callable] = []
+        self._error_cbs: list[Callable] = []
         self._named_cbs:    dict[tuple[str, str], list[Callable]] = {}
 
         for device_type, surface in self.surfaces.items():
@@ -81,6 +84,12 @@ class MultiSurface:
             surface.on_dial(self._make_forwarder(device_type, surface, self._dial_cbs))
             surface.on_tbar(self._make_forwarder(device_type, surface, self._tbar_cbs))
             surface.on_joystick(self._make_forwarder(device_type, surface, self._joystick_cbs))
+            surface.on_connection(self._make_system_forwarder(
+                device_type, surface, self._connection_cbs,
+            ))
+            surface.on_error(self._make_system_forwarder(
+                device_type, surface, self._error_cbs,
+            ))
 
     # ═══════════════════════════════════════════════════════════════
     #  Per-device access
@@ -116,10 +125,28 @@ class MultiSurface:
         def forward(event: Event) -> None:
             event.device_type = device_type
             event.surface = surface
-            for cb in cb_list:
-                cb(event)
-            for cb in self._named_cbs.get((device_type, event.control), ()):
-                cb(event)
+            callbacks = (
+                tuple(cb_list)
+                + tuple(self._named_cbs.get((device_type, event.control), ()))
+            )
+            for cb in callbacks:
+                try:
+                    cb(event)
+                except Exception as exc:
+                    surface._report_error(exc, 'hub_callback', fatal=False)
+        return forward
+
+    @staticmethod
+    def _make_system_forwarder(
+        device_type: str, surface: ControlSurface, cb_list: list,
+    ) -> Callable:
+        def forward(event: ConnectionEvent | SurfaceErrorEvent) -> None:
+            for cb in tuple(cb_list):
+                try:
+                    cb(device_type, surface, event)
+                except Exception:
+                    # Do not recursively report failures from an error handler.
+                    pass
         return forward
 
     def on_button(self, fn: Callable) -> Callable:
@@ -141,6 +168,29 @@ class MultiSurface:
         """Register a callback for joystick telemetry events, on any device."""
         self._joystick_cbs.append(fn)
         return fn
+
+    def on_connection(self, fn: Callable) -> Callable:
+        """Register ``fn(device_type, surface, event)`` for lifecycle changes."""
+        self._connection_cbs.append(fn)
+        return fn
+
+    def on_error(self, fn: Callable) -> Callable:
+        """Register ``fn(device_type, surface, event)`` for device errors."""
+        self._error_cbs.append(fn)
+        return fn
+
+    def remove_callback(self, fn: Callable) -> bool:
+        removed = False
+        registries = [
+            self._button_cbs, self._dial_cbs, self._tbar_cbs,
+            self._joystick_cbs, self._connection_cbs, self._error_cbs,
+            *self._named_cbs.values(),
+        ]
+        for callbacks in registries:
+            while fn in callbacks:
+                callbacks.remove(fn)
+                removed = True
+        return removed
 
     def on(self, device_type: str, control: str, fn: Callable | None = None) -> Callable:
         """
@@ -175,8 +225,15 @@ class MultiSurface:
     # ═══════════════════════════════════════════════════════════════
 
     def connect(self) -> None:
-        for surface in self.surfaces.values():
-            surface.connect()
+        connected: list[ControlSurface] = []
+        try:
+            for surface in self.surfaces.values():
+                surface.connect()
+                connected.append(surface)
+        except Exception:
+            for surface in reversed(connected):
+                surface.disconnect()
+            raise
 
     def disconnect(self) -> None:
         for surface in self.surfaces.values():
@@ -224,3 +281,9 @@ class MultiSurface:
         """Reset every LED on every connected device."""
         for surface in self.surfaces.values():
             surface.all_off()
+
+    @property
+    def state(self):
+        """Snapshot each device by type for application status models."""
+        return {device_type: surface.state
+                for device_type, surface in self.surfaces.items()}

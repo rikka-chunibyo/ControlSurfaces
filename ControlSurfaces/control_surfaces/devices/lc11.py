@@ -53,6 +53,7 @@ from ..auto_leds  import AutoLEDs
 
 BAUD          = 9600
 WAKE_SEQUENCE = b'\x43\x00\x00\x00'
+HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
 
 # ── bus rows: EFFECTS / LIVE / PREVIEW (11 identical columns) ───────
 BUS_ROW_PREFIX_TO_ROW = {'F': 'EFFECTS', '2': 'LIVE', '1': 'PREVIEW'}
@@ -176,11 +177,31 @@ class LC11Surface(ControlSurface):
         baud:       int  = BAUD,
         auto_leds:  bool = False,
         threadsafe: bool = False,
+        reconnect: bool = False,
+        reconnect_interval: float = 1.0,
+        poll_interval: float = 0.01,
+        coalesce_continuous: bool = True,
+        tbar_endpoint_confirmations: int = 2,
+        tbar_endpoint_settle: float = 0.05,
     ) -> None:
-        super().__init__(port, baud, _build_controls(), threadsafe=threadsafe)
+        super().__init__(
+            port, baud, _build_controls(), threadsafe=threadsafe,
+            reconnect=reconnect, reconnect_interval=reconnect_interval,
+            poll_interval=poll_interval,
+            coalesce_continuous=coalesce_continuous,
+        )
+
+        if tbar_endpoint_confirmations < 1:
+            raise ValueError('tbar_endpoint_confirmations must be at least 1')
+        self.tbar_endpoint_confirmations = tbar_endpoint_confirmations
+        self.tbar_endpoint_settle = max(0.0, tbar_endpoint_settle)
 
         self._ser: serial.Serial | None = None
         self._buffer = ""
+        self._pending_endpoint: str | None = None
+        self._pending_endpoint_count = 0
+        self._pending_endpoint_value: int | None = None
+        self._pending_endpoint_since = 0.0
 
         # ── LED banks ─────────────────────────────────────────────
         self._bus_row_banks = {
@@ -241,6 +262,22 @@ class LC11Surface(ControlSurface):
             self._ser.close()
         self._ser = None
 
+    def _reset_outputs(self) -> None:
+        for bank in (*self._bus_row_banks.values(), self._caret_f_bank,
+                     self._caret_1_bank, self._tilde_3_bank):
+            bank.clear_all()
+
+    def _reset_input_state(self) -> None:
+        self._buffer = ""
+        self._prev_bus_row = {
+            row: set() for row in BUS_ROW_PREFIX_TO_ROW.values()
+        }
+        self._prev_group = {'^2': set(), '^F': set(), '^1': set(), '~3': set()}
+        self._pending_endpoint = None
+        self._pending_endpoint_count = 0
+        self._pending_endpoint_value = None
+        self._pending_endpoint_since = 0.0
+
     # ═══════════════════════════════════════════════════════════════
     #  Framing
     # ═══════════════════════════════════════════════════════════════
@@ -273,8 +310,14 @@ class LC11Surface(ControlSurface):
                     break   # final digit hasn't arrived yet -- wait for more bytes
                 idx2  = rest.index('\r')
                 extra = rest[:idx2].strip()
-                self._buffer = rest[idx2 + 1:]
-                message = message + extra
+                if len(extra) == 1 and extra in HEX_DIGITS:
+                    self._buffer = rest[idx2 + 1:]
+                    message = message + extra
+                else:
+                    # Preserve the following token: only the malformed
+                    # first half is discarded, so framing can resynchronise.
+                    self._buffer = rest
+                    continue
             else:
                 self._buffer = rest
 
@@ -297,8 +340,11 @@ class LC11Surface(ControlSurface):
     def _poll(self) -> None:
         for message in self._read_messages():
             self._dispatch(message)
+        self._flush_pending_tbar()
 
     def _dispatch(self, message: str) -> None:
+        if len(message) < 3 or message[0] not in ('~', '^'):
+            return
         prefix = message[0]
         group  = message[1]
         payload = message[2:]
@@ -309,6 +355,8 @@ class LC11Surface(ControlSurface):
 
         # ── dial telemetry ────────────────────────────────────────
         elif prefix == '~' and group in DIAL_TELEMETRY_GROUP_TO_NAME:
+            if len(payload) != 2 or any(c not in HEX_DIGITS for c in payload):
+                return
             try:
                 value = int(payload, 16)
             except ValueError:
@@ -317,11 +365,13 @@ class LC11Surface(ControlSurface):
 
         # ── T-bar ──────────────────────────────────────────────────
         elif prefix == '~' and group == '4':
+            if len(payload) != 2 or any(c not in HEX_DIGITS for c in payload):
+                return
             try:
                 value = int(payload, 16)
             except ValueError:
                 return
-            self._emit_tbar(value)
+            self._emit_confirmed_tbar(value)
 
         # ── action group (TAKE/AUTO/FADE_ALL/TAKE_ALL/overlay fade-take) ──
         elif prefix == '~' and group == '3':
@@ -347,7 +397,45 @@ class LC11Surface(ControlSurface):
         # original driver's UNPARSED_DIAGNOSTIC handling (nothing to
         # emit for a message we can't map to a known control).
 
+    def _emit_confirmed_tbar(self, value: int) -> None:
+        """Suppress momentary false endpoint reports from the LC-11 ADC."""
+        normalized = value if self.TBAR_INVERTED else (255 - value)
+        tol = self.TBAR_ENDPOINT_TOLERANCE
+        endpoint = ('top' if normalized >= 255 - tol else
+                    'bottom' if normalized <= tol else None)
+        if endpoint is None or self.tbar_endpoint_confirmations == 1:
+            self._pending_endpoint = None
+            self._pending_endpoint_count = 0
+            self._pending_endpoint_value = None
+            self._emit_tbar(value)
+            return
+        if endpoint == self._pending_endpoint:
+            self._pending_endpoint_count += 1
+        else:
+            self._pending_endpoint = endpoint
+            self._pending_endpoint_count = 1
+            self._pending_endpoint_since = time.monotonic()
+        self._pending_endpoint_value = value
+        if self._pending_endpoint_count >= self.tbar_endpoint_confirmations:
+            self._emit_tbar(value)
+            self._pending_endpoint = None
+            self._pending_endpoint_count = 0
+            self._pending_endpoint_value = None
+
+    def _flush_pending_tbar(self) -> None:
+        """Deliver a real endpoint even if the stationary panel sends it once."""
+        if (self._pending_endpoint_value is not None
+                and time.monotonic() - self._pending_endpoint_since
+                >= self.tbar_endpoint_settle):
+            value = self._pending_endpoint_value
+            self._pending_endpoint = None
+            self._pending_endpoint_count = 0
+            self._pending_endpoint_value = None
+            self._emit_tbar(value)
+
     def _decode_bus_row(self, row: str, payload: str) -> None:
+        if len(payload) != 3 or any(c not in HEX_DIGITS for c in payload):
+            return
         try:
             word = int(payload, 16)
         except ValueError:
@@ -366,6 +454,8 @@ class LC11Surface(ControlSurface):
         self._prev_bus_row[row] = now
 
     def _decode_group(self, key: str, payload: str, bits: dict[str, int], baseline: int) -> None:
+        if len(payload) != 2 or any(c not in HEX_DIGITS for c in payload):
+            return
         try:
             val = int(payload, 16)
         except ValueError:

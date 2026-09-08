@@ -21,15 +21,20 @@
 from __future__ import annotations
 
 import queue
+import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable
 
 from .control   import Control
-from .events    import ButtonEvent, DialEvent, TBarEvent, JoystickEvent
+from .events    import (
+    ButtonEvent, DialEvent, TBarEvent, JoystickEvent,
+    ConnectionEvent, ConnectionStatus, SurfaceErrorEvent, event_timestamp,
+)
 
 Event = ButtonEvent | DialEvent | TBarEvent | JoystickEvent
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,8 @@ class SurfaceState:
     dials:     dict[str, DialEvent]
     tbar:      TBarEvent | None
     joysticks: dict[str, JoystickEvent]
+    connected: bool = False
+    status: ConnectionStatus = ConnectionStatus.DISCONNECTED
 
 
 class ControlSurface:
@@ -105,17 +112,33 @@ class ControlSurface:
         baud:       int,
         controls:   dict[str, Control],
         threadsafe: bool = False,
+        reconnect: bool = False,
+        reconnect_interval: float = 1.0,
+        poll_interval: float = 0.01,
+        coalesce_continuous: bool = True,
     ) -> None:
         self.port       = port
         self.baud       = baud
         self.controls   = controls
         self._threadsafe = threadsafe
+        self.reconnect = reconnect
+        self.reconnect_interval = max(0.05, reconnect_interval)
+        self.poll_interval = max(0.001, poll_interval)
+        self.coalesce_continuous = coalesce_continuous
 
         self._alias_lookup = self._build_alias_lookup()
 
         self._thread:  threading.Thread | None = None
         self._running  = False
         self._queue:   queue.Queue = queue.Queue()
+        self._queue_lock = threading.Lock()
+        self._coalesced_callbacks: dict[tuple, tuple[Callable, Event]] = {}
+        self._stop_event = threading.Event()
+        self._state_lock = threading.RLock()
+        self._io_lock = threading.RLock()
+        self._connected = False
+        self._status = ConnectionStatus.DISCONNECTED
+        self._last_error: SurfaceErrorEvent | None = None
 
         # ── callback registries ──────────────────────────────────
         self._button_cbs:   list[Callable] = []
@@ -123,6 +146,8 @@ class ControlSurface:
         self._tbar_cbs:     list[Callable] = []
         self._joystick_cbs: list[Callable] = []
         self._named_cbs:    dict[str, list[Callable]] = {}
+        self._connection_cbs: list[Callable] = []
+        self._error_cbs: list[Callable] = []
 
         # ── state tracking ───────────────────────────────────────
         self._lit:            set[str] = set()
@@ -160,30 +185,65 @@ class ControlSurface:
 
     @staticmethod
     def _as_list(val) -> list:
-        return val if isinstance(val, list) else [val]
+        if isinstance(val, str):
+            return [val]
+        try:
+            return list(val)
+        except TypeError:
+            return [val]
 
     # ═══════════════════════════════════════════════════════════════
     #  Connection
     # ═══════════════════════════════════════════════════════════════
 
     def connect(self) -> None:
-        """Open the connection and reset every LED to off."""
-        self._open()
-        self._lit.clear()
-        self.all_off()
+        """Open the connection and force every hardware LED off."""
+        with self._io_lock:
+            if self._connected:
+                return
+            self._clear_pending_callbacks()
+            self._set_status(ConnectionStatus.CONNECTING)
+            try:
+                self._open()
+                self._connected = True
+                self._reset_input_state()
+                self._reset_outputs()
+                with self._state_lock:
+                    self._lit.clear()
+                    self._last_error = None
+                self._set_status(ConnectionStatus.CONNECTED)
+            except Exception as exc:
+                self._connected = False
+                try:
+                    self._close()
+                except Exception:
+                    pass
+                self._set_status(ConnectionStatus.DISCONNECTED)
+                self._report_error(exc, 'connect', fatal=True)
+                raise
 
     def disconnect(self) -> None:
         """Stop the reader thread, reset LEDs, and close the connection."""
         self._running = False
-        if self._thread and self._thread.is_alive():
+        self._stop_event.set()
+        if (self._thread and self._thread.is_alive()
+                and self._thread is not threading.current_thread()):
             self._thread.join(timeout=1.0)
         self._thread = None
 
-        try:
-            self.all_off()
-        except Exception:
-            pass
-        self._close()
+        with self._io_lock:
+            if self._connected:
+                try:
+                    self._reset_outputs()
+                except Exception as exc:
+                    self._report_error(exc, 'disconnect_led_reset', fatal=False)
+            try:
+                self._close()
+            finally:
+                self._connected = False
+                with self._state_lock:
+                    self._lit.clear()
+                self._set_status(ConnectionStatus.DISCONNECTED)
 
     def __enter__(self) -> 'ControlSurface':
         self.connect()
@@ -200,6 +260,15 @@ class ControlSurface:
     def _close(self) -> None:
         raise NotImplementedError
 
+    def _reset_outputs(self) -> None:
+        """Force output hardware to its baseline, including stale LEDs."""
+        for name, control in self.controls.items():
+            if control.has_led:
+                self._write_led(name, False)
+
+    def _reset_input_state(self) -> None:
+        """Subclasses may clear protocol-specific delta/framing state."""
+
     # ═══════════════════════════════════════════════════════════════
     #  LED control -- every LED-capable control lives in one flat
     #  namespace, regardless of which wire-level byte it happens to
@@ -210,8 +279,14 @@ class ControlSurface:
         """Turn on one or more controls' LEDs; others are unchanged."""
         for name in self._as_list(controls):
             resolved = self._resolve_led(name)
-            self._lit.add(resolved)
-            self._write_led(resolved, True)
+            with self._state_lock:
+                if resolved in self._lit:
+                    continue
+            with self._io_lock:
+                self._require_connected()
+                self._write_led(resolved, True)
+                with self._state_lock:
+                    self._lit.add(resolved)
 
     def clear(self, controls=None) -> None:
         """
@@ -221,31 +296,45 @@ class ControlSurface:
         clear(['A','B']) -- A and B off, others unchanged
         """
         if controls is None:
-            for name in list(self._lit):
-                self._lit.discard(name)
-                self._write_led(name, False)
+            with self._state_lock:
+                names = list(self._lit)
+            for name in names:
+                with self._io_lock:
+                    self._require_connected()
+                    self._write_led(name, False)
+                    with self._state_lock:
+                        self._lit.discard(name)
         else:
             for name in self._as_list(controls):
                 resolved = self._resolve_led(name)
-                self._lit.discard(resolved)
-                self._write_led(resolved, False)
+                with self._state_lock:
+                    if resolved not in self._lit:
+                        continue
+                with self._io_lock:
+                    self._require_connected()
+                    self._write_led(resolved, False)
+                    with self._state_lock:
+                        self._lit.discard(resolved)
 
     def set_only(self, controls) -> None:
         """Turn on the target control(s) and turn off everything else."""
         target = {self._resolve_led(n) for n in self._as_list(controls)}
-        for name in list(self._lit - target):
-            self._lit.discard(name)
-            self._write_led(name, False)
-        for name in target - self._lit:
-            self._lit.add(name)
-            self._write_led(name, True)
+        with self._state_lock:
+            current = set(self._lit)
+        self.clear(list(current - target))
+        self.set(list(target - current))
 
     def all_off(self) -> None:
         """Reset every LED on the device to off. Safe to call any time."""
         self.clear()
 
     def is_lit(self, control: str) -> bool:
-        return self._resolve(control) in self._lit
+        with self._state_lock:
+            return self._resolve(control) in self._lit
+
+    def _require_connected(self) -> None:
+        if not self._connected:
+            raise RuntimeError('Surface is not connected.')
 
     def _resolve_led(self, name: str) -> str:
         resolved = self._resolve(name)
@@ -264,12 +353,31 @@ class ControlSurface:
 
     @property
     def state(self) -> SurfaceState:
-        return SurfaceState(
-            lit       = frozenset(self._lit),
-            dials     = dict(self._last_dials),
-            tbar      = self._last_tbar,
-            joysticks = dict(self._last_joysticks),
-        )
+        with self._state_lock:
+            return SurfaceState(
+                lit       = frozenset(self._lit),
+                dials     = dict(self._last_dials),
+                tbar      = self._last_tbar,
+                joysticks = dict(self._last_joysticks),
+                connected = self._connected,
+                status = self._status,
+            )
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    @property
+    def is_running(self) -> bool:
+        return bool(self._running and self._thread and self._thread.is_alive())
+
+    @property
+    def status(self) -> ConnectionStatus:
+        return self._status
+
+    @property
+    def last_error(self) -> SurfaceErrorEvent | None:
+        return self._last_error
 
     # ═══════════════════════════════════════════════════════════════
     #  Callback registration
@@ -294,6 +402,30 @@ class ControlSurface:
         """Register a callback for joystick telemetry events on any joystick."""
         self._joystick_cbs.append(fn)
         return fn
+
+    def on_connection(self, fn: Callable) -> Callable:
+        """Register a callback for lifecycle changes."""
+        self._connection_cbs.append(fn)
+        return fn
+
+    def on_error(self, fn: Callable) -> Callable:
+        """Register a callback for serial and user-callback failures."""
+        self._error_cbs.append(fn)
+        return fn
+
+    def remove_callback(self, fn: Callable) -> bool:
+        """Remove a callback from every registry; useful for closing views."""
+        removed = False
+        registries = [
+            self._button_cbs, self._dial_cbs, self._tbar_cbs,
+            self._joystick_cbs, self._connection_cbs, self._error_cbs,
+            *self._named_cbs.values(),
+        ]
+        for callbacks in registries:
+            while fn in callbacks:
+                callbacks.remove(fn)
+                removed = True
+        return removed
 
     def on(self, control: str, fn: Callable | None = None) -> Callable:
         """
@@ -328,7 +460,9 @@ class ControlSurface:
         """Start a background daemon thread. Returns immediately."""
         if self._thread and self._thread.is_alive():
             return
+        self._require_connected()
         self._running = True
+        self._stop_event.clear()
         self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -338,7 +472,9 @@ class ControlSurface:
 
     def run(self) -> None:
         """Block on the reader loop. Returns on KeyboardInterrupt or stop()."""
+        self._require_connected()
         self._running = True
+        self._stop_event.clear()
         try:
             self._loop()
         except KeyboardInterrupt:
@@ -355,15 +491,95 @@ class ControlSurface:
             raise RuntimeError("poll() requires threadsafe=True")
         while True:
             try:
-                cb, event = self._queue.get_nowait()
-                cb(event)
+                kind, payload = self._queue.get_nowait()
+                if kind == 'coalesced':
+                    with self._queue_lock:
+                        pending = self._coalesced_callbacks.pop(payload, None)
+                    if pending is None:
+                        continue
+                    cb, event = pending
+                else:
+                    cb, event = payload
+                try:
+                    cb(event)
+                except Exception as exc:
+                    if not isinstance(event, SurfaceErrorEvent):
+                        self._report_error(exc, 'callback', fatal=False)
+            except queue.Empty:
+                break
+
+    @property
+    def pending_callbacks(self) -> int:
+        """Approximate number of callbacks waiting for GUI-thread dispatch."""
+        return self._queue.qsize()
+
+    def _clear_pending_callbacks(self) -> None:
+        with self._queue_lock:
+            self._coalesced_callbacks.clear()
+        while True:
+            try:
+                self._queue.get_nowait()
             except queue.Empty:
                 break
 
     def _loop(self) -> None:
-        while self._running:
-            self._poll()
-            time.sleep(0.02)
+        while self._running and not self._stop_event.is_set():
+            try:
+                with self._io_lock:
+                    self._poll()
+            except Exception as exc:
+                self._connected = False
+                self._report_error(exc, 'read', fatal=not self.reconnect)
+                if self.reconnect:
+                    self._set_status(ConnectionStatus.RECONNECTING)
+                else:
+                    try:
+                        self._close()
+                    except Exception:
+                        pass
+                if not self.reconnect or not self._reconnect_loop():
+                    self._running = False
+                    break
+            self._stop_event.wait(self.poll_interval)
+
+        if self._status is not ConnectionStatus.DISCONNECTED:
+            self._set_status(ConnectionStatus.STOPPED)
+
+    def _reconnect_loop(self) -> bool:
+        attempt = 0
+        try:
+            self._close()
+        except Exception:
+            pass
+        while self._running and not self._stop_event.wait(self.reconnect_interval):
+            attempt += 1
+            self._set_status(ConnectionStatus.RECONNECTING, attempt)
+            try:
+                with self._io_lock:
+                    self._open()
+                    self._connected = True
+                    self._reset_input_state()
+                    self._reset_outputs()
+                with self._state_lock:
+                    self._lit.clear()
+                self._set_status(ConnectionStatus.CONNECTED, attempt)
+                return True
+            except Exception as exc:
+                self._connected = False
+                self._report_error(exc, 'reconnect', fatal=False)
+                try:
+                    self._close()
+                except Exception:
+                    pass
+        return False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for the background reader to stop. Return False on timeout."""
+        thread = self._thread
+        if not thread:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
     # ── subclass hook (reader) ─────────────────────────────────────
 
@@ -377,16 +593,22 @@ class ControlSurface:
 
     def simulate(self, event: Event) -> None:
         """Inject a fake event -- useful for unit testing without hardware."""
+        if event.timestamp == 0.0:
+            event.timestamp = event_timestamp()
+        event.surface = self
         if isinstance(event, ButtonEvent):
             self._dispatch_button(event)
         elif isinstance(event, DialEvent):
-            self._last_dials[event.control] = event
+            with self._state_lock:
+                self._last_dials[event.control] = event
             self._dispatch_dial(event)
         elif isinstance(event, TBarEvent):
-            self._last_tbar = event
+            with self._state_lock:
+                self._last_tbar = event
             self._dispatch_tbar(event)
         elif isinstance(event, JoystickEvent):
-            self._last_joysticks[event.control] = event
+            with self._state_lock:
+                self._last_joysticks[event.control] = event
             self._dispatch_joystick(event)
         else:
             raise TypeError(f"Unrecognised event type: {type(event)}")
@@ -396,11 +618,16 @@ class ControlSurface:
     # ═══════════════════════════════════════════════════════════════
 
     def _emit_button(self, control: str, held: bool) -> None:
-        self._dispatch_button(ButtonEvent(control=control, held=held))
+        self._dispatch_button(ButtonEvent(
+            control=control, held=held, timestamp=event_timestamp(), surface=self,
+        ))
 
     def _emit_dial(self, control: str, value: int) -> None:
-        event = DialEvent(control=control, value=value)
-        self._last_dials[control] = event
+        event = DialEvent(
+            control=control, value=value, timestamp=event_timestamp(), surface=self,
+        )
+        with self._state_lock:
+            self._last_dials[control] = event
         self._dispatch_dial(event)
 
     def _emit_tbar(self, raw: int) -> None:
@@ -414,8 +641,10 @@ class ControlSurface:
             control='TBAR', raw=raw, position=position,
             at_top=(normalized >= 255 - tol),
             at_bottom=(normalized <= tol),
+            timestamp=event_timestamp(), surface=self,
         )
-        self._last_tbar = event
+        with self._state_lock:
+            self._last_tbar = event
         self._dispatch_tbar(event)
 
     def _emit_joystick(self, control: str, raw: str) -> None:
@@ -423,38 +652,84 @@ class ControlSurface:
             value = int(raw, 16)
         except (TypeError, ValueError):
             value = None
-        event = JoystickEvent(control=control, raw=raw, value=value)
-        self._last_joysticks[control] = event
+        event = JoystickEvent(
+            control=control, raw=raw, value=value,
+            timestamp=event_timestamp(), surface=self,
+        )
+        with self._state_lock:
+            self._last_joysticks[control] = event
         self._dispatch_joystick(event)
 
     # ── dispatch internals ──────────────────────────────────────────
 
     def _dispatch_button(self, event: ButtonEvent) -> None:
-        for cb in self._button_cbs:
+        for cb in tuple(self._button_cbs):
             self._invoke(cb, event)
-        for cb in self._named_cbs.get(event.control, ()):
+        for cb in tuple(self._named_cbs.get(event.control, ())):
             self._invoke(cb, event)
 
     def _dispatch_dial(self, event: DialEvent) -> None:
-        for cb in self._dial_cbs:
+        for cb in tuple(self._dial_cbs):
             self._invoke(cb, event)
-        for cb in self._named_cbs.get(event.control, ()):
+        for cb in tuple(self._named_cbs.get(event.control, ())):
             self._invoke(cb, event)
 
     def _dispatch_tbar(self, event: TBarEvent) -> None:
-        for cb in self._tbar_cbs:
+        for cb in tuple(self._tbar_cbs):
             self._invoke(cb, event)
-        for cb in self._named_cbs.get(event.control, ()):
+        for cb in tuple(self._named_cbs.get(event.control, ())):
             self._invoke(cb, event)
 
     def _dispatch_joystick(self, event: JoystickEvent) -> None:
-        for cb in self._joystick_cbs:
+        for cb in tuple(self._joystick_cbs):
             self._invoke(cb, event)
-        for cb in self._named_cbs.get(event.control, ()):
+        for cb in tuple(self._named_cbs.get(event.control, ())):
             self._invoke(cb, event)
 
     def _invoke(self, cb: Callable, event: Event) -> None:
         if self._threadsafe:
-            self._queue.put((cb, event))
+            self._enqueue_callback(cb, event)
         else:
-            cb(event)
+            try:
+                cb(event)
+            except Exception as exc:
+                self._report_error(exc, 'callback', fatal=False)
+
+    def _enqueue_callback(self, cb: Callable, event) -> None:
+        if self.coalesce_continuous and isinstance(
+            event, (DialEvent, TBarEvent, JoystickEvent),
+        ):
+            key = (id(cb), type(event), event.control)
+            with self._queue_lock:
+                first = key not in self._coalesced_callbacks
+                self._coalesced_callbacks[key] = (cb, event)
+                if first:
+                    self._queue.put(('coalesced', key))
+            return
+        self._queue.put(('direct', (cb, event)))
+
+    def _set_status(self, status: ConnectionStatus, attempt: int = 0) -> None:
+        if status == self._status and not attempt:
+            return
+        self._status = status
+        event = ConnectionEvent(status, attempt, event_timestamp())
+        for cb in tuple(self._connection_cbs):
+            self._invoke(cb, event)
+
+    def _report_error(self, error: Exception, operation: str, fatal: bool) -> None:
+        event = SurfaceErrorEvent(error, operation, fatal, event_timestamp())
+        log.log(
+            logging.ERROR if fatal else logging.WARNING,
+            '%s error on %s: %s', operation, self.port, error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        with self._state_lock:
+            self._last_error = event
+        for cb in tuple(self._error_cbs):
+            if self._threadsafe:
+                self._queue.put(('direct', (cb, event)))
+            else:
+                try:
+                    cb(event)
+                except Exception:
+                    pass

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "control-surfaces"
+version = "0.2.0"
+description = "Application-facing drivers for NewTek TriCaster VM and LiveControl LC-11 panels"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pyserial>=3.5"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1"]
+
+[tool.setuptools.packages.find]
+include = ["control_surfaces*"]
+
+[tool.setuptools.package-data]
+control_surfaces = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

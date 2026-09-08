@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 
@@ -54,29 +55,37 @@ class LEDBank:
         self._baseline    = baseline
         self._active_low  = active_low
         self._on: set[str] = set()
+        self._lock = threading.RLock()
 
     def set(self, name: str) -> None:
-        self._on.add(name)
-        self._push()
+        with self._lock:
+            target = self._on | {name}
+            self._push(target)
+            self._on = target
 
     def clear(self, name: str) -> None:
-        self._on.discard(name)
-        self._push()
+        with self._lock:
+            target = self._on - {name}
+            self._push(target)
+            self._on = target
 
     def clear_all(self) -> None:
-        self._on.clear()
-        self._push()
+        with self._lock:
+            self._push(set())
+            self._on.clear()
 
     def is_on(self, name: str) -> bool:
-        return name in self._on
+        with self._lock:
+            return name in self._on
 
     @property
     def lit(self) -> frozenset[str]:
-        return frozenset(self._on)
+        with self._lock:
+            return frozenset(self._on)
 
-    def _push(self) -> None:
+    def _push(self, names: set[str]) -> None:
         val = self._baseline
-        for name in self._on:
+        for name in names:
             bit = self._bits[name]
             if self._active_low:
                 val &= ~bit

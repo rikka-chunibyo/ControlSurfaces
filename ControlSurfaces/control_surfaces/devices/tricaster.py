@@ -141,10 +141,20 @@ class TriCasterSurface(ControlSurface):
         baud:       int  = BAUD,
         auto_leds:  bool = False,
         threadsafe: bool = False,
+        reconnect: bool = False,
+        reconnect_interval: float = 1.0,
+        poll_interval: float = 0.01,
+        coalesce_continuous: bool = True,
     ) -> None:
-        super().__init__(port, baud, _build_controls(), threadsafe=threadsafe)
+        super().__init__(
+            port, baud, _build_controls(), threadsafe=threadsafe,
+            reconnect=reconnect, reconnect_interval=reconnect_interval,
+            poll_interval=poll_interval,
+            coalesce_continuous=coalesce_continuous,
+        )
 
         self._ser: serial.Serial | None = None
+        self._buffer = bytearray()
 
         # ── LED banks: LIVE row, NEXT row, and the ch3 shared byte ──
         self._banks = {
@@ -176,11 +186,21 @@ class TriCasterSurface(ControlSurface):
 
     def _open(self) -> None:
         self._ser = serial.Serial(self.port, self.baud, timeout=0.1)
+        self._buffer.clear()
 
     def _close(self) -> None:
         if self._ser and self._ser.is_open:
             self._ser.close()
         self._ser = None
+
+    def _reset_outputs(self) -> None:
+        for bank in self._banks.values():
+            bank.clear_all()
+
+    def _reset_input_state(self) -> None:
+        self._buffer.clear()
+        self._prev_row = {'LIVE': set(), 'NEXT': set()}
+        self._prev_misc.clear()
 
     # ═══════════════════════════════════════════════════════════════
     #  Framing
@@ -192,20 +212,29 @@ class TriCasterSurface(ControlSurface):
     def _read_frames(self) -> list[tuple[str, int]]:
         if not self._ser or not self._ser.in_waiting:
             return []
-        raw = self._ser.read(self._ser.in_waiting)
+        self._buffer.extend(self._ser.read(self._ser.in_waiting))
         frames: list[tuple[str, int]] = []
-        i = 0
-        while i <= len(raw) - 5:
-            if raw[i] == 0x7E and raw[i + 4] == 0x0D:
-                try:
-                    ch  = chr(raw[i + 1])
-                    val = int(chr(raw[i + 2]) + chr(raw[i + 3]), 16)
-                    frames.append((ch, val))
-                except (ValueError, UnicodeDecodeError):
-                    pass
-                i += 5
-            else:
-                i += 1
+        while self._buffer:
+            try:
+                start = self._buffer.index(0x7E)
+            except ValueError:
+                self._buffer.clear()
+                break
+            if start:
+                del self._buffer[:start]
+            if len(self._buffer) < 5:
+                break
+            if self._buffer[4] != 0x0D:
+                del self._buffer[0]
+                continue
+            try:
+                ch = chr(self._buffer[1])
+                val = int(bytes(self._buffer[2:4]).decode('ascii'), 16)
+            except (ValueError, UnicodeDecodeError):
+                del self._buffer[0]
+                continue
+            frames.append((ch, val))
+            del self._buffer[:5]
         return frames
 
     # ═══════════════════════════════════════════════════════════════

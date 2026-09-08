@@ -102,6 +102,13 @@ class DeviceMatch:
     port:        str
     device_type: str   # TRICASTER | LC11
     method:      str   # 'usb_id' | 'description' | 'protocol_probe'
+    serial_number: str | None = None
+    description: str | None = None
+
+    @property
+    def stable_id(self) -> str:
+        """Persistent configuration key when USB serial data is available."""
+        return self.serial_number or self.port
 
     def open(self, **kwargs) -> 'ControlSurface':
         """Instantiate the right surface class for this match. Doesn't
@@ -151,6 +158,14 @@ def list_serial_ports():
         ...     print(p.device, hex(p.vid or 0), hex(p.pid or 0), p.description)
     """
     return list(list_ports.comports())
+
+
+def find_port_by_serial(serial_number: str) -> str | None:
+    """Resolve a persistent USB serial number to its current COM/tty port."""
+    for port_info in list_ports.comports():
+        if port_info.serial_number == serial_number:
+            return port_info.device
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -444,7 +459,10 @@ def detect_devices(
             device_type = _match_serial_cache(port_info, serial_cache)
             method = 'serial_cache'
         if device_type is not None:
-            resolved[port_info.device] = DeviceMatch(port_info.device, device_type, method)
+            resolved[port_info.device] = DeviceMatch(
+                port_info.device, device_type, method,
+                port_info.serial_number, port_info.description,
+            )
         else:
             unresolved.append(port_info)
 
@@ -454,7 +472,10 @@ def detect_devices(
             device_type = probed.get(port_info.device)
             if device_type is not None:
                 _learn_serial(cache_path, port_info.serial_number, device_type)
-                resolved[port_info.device] = DeviceMatch(port_info.device, device_type, 'protocol_probe')
+                resolved[port_info.device] = DeviceMatch(
+                    port_info.device, device_type, 'protocol_probe',
+                    port_info.serial_number, port_info.description,
+                )
 
     # preserve OS enumeration order
     return [resolved[p.device] for p in list_ports.comports() if p.device in resolved]

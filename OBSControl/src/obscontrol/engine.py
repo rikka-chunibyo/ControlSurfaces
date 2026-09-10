@@ -29,6 +29,7 @@ class ControllerEngine:
         self._analog_lock = threading.Lock()
         self._analog_pending: dict[str, tuple[Mapping, dict]] = {}
         self._analog_running: set[str] = set()
+        self._dial_values: dict[tuple[str, str], int] = {}
         self._log_callbacks: list[Callable[[str, str], None]] = []
         self._state_callbacks: list[Callable[[ObsState], None]] = []
         self._panel_callbacks: list[Callable[[str, str], None]] = []
@@ -75,6 +76,8 @@ class ControllerEngine:
 
     def restart(self) -> None:
         self.obs.close()
+        with self._analog_lock:
+            self._dial_values.clear()
         self.panels.connect_all(self.config.panels)
         self._refresh.set()
 
@@ -210,12 +213,14 @@ class ControllerEngine:
             "PANEL", f"{panel_id}: {event.control} {detail}"
             + (f" -> {len(mappings)} mapping(s)" if mappings else ""),
         )
+        dial_delta = self._dial_delta(panel_id, event) if isinstance(event, DialEvent) else None
         for mapping in mappings:
             context = {
                 "position": getattr(event, "position", None),
                 "value": getattr(event, "value", None),
                 "volume": (getattr(event, "value", 0) / 255.0
                            if isinstance(event, DialEvent) else None),
+                "delta": dial_delta,
                 "raw": getattr(event, "raw", None),
                 "held": getattr(event, "held", None),
                 "at_top": getattr(event, "at_top", False),
@@ -229,13 +234,32 @@ class ControllerEngine:
                 self._executor.submit(self._run_mapping, mapping, context)
 
     def _submit_latest(self, mapping: Mapping, context: dict) -> None:
-        """Coalesce fast analog input so stale positions never overtake newer ones."""
+        """Coalesce analog input, while retaining every relative dial movement."""
         with self._analog_lock:
+            previous = self._analog_pending.get(mapping.id)
+            if previous and context.get("delta") is not None:
+                context = dict(context)
+                context["delta"] += previous[1].get("delta") or 0
             self._analog_pending[mapping.id] = (mapping, context)
             if mapping.id in self._analog_running:
                 return
             self._analog_running.add(mapping.id)
         self._executor.submit(self._drain_latest, mapping.id)
+
+    def _dial_delta(self, panel_id: str, event: DialEvent) -> int:
+        """Find a signed encoder step, correctly handling the 0/255 wrap."""
+        key = (panel_id, event.control)
+        with self._analog_lock:
+            previous = self._dial_values.get(key)
+            self._dial_values[key] = event.value
+        if previous is None:
+            return 0
+        delta = event.value - previous
+        if delta > 127:
+            return delta - 256
+        if delta < -127:
+            return delta + 256
+        return delta
 
     def _drain_latest(self, mapping_id: str) -> None:
         while True:

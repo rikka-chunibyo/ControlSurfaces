@@ -12,7 +12,8 @@ from .config import default_config_path, save_config
 from .engine import ControllerEngine
 from .models import ActionSpec, AppConfig, LedRule, Mapping, PanelConfig
 from .panels import (
-    SURFACE_CLASSES, input_control_names, led_control_names, triggers_for_control,
+    SURFACE_CLASSES, display_control_name, input_control_names, led_control_names,
+    triggers_for_control,
 )
 
 
@@ -46,7 +47,7 @@ ACTION_DESCRIPTIONS = {
     "set_transition_duration": "Change the duration used by configurable transitions.",
     "set_tbar_position": "Follow the physical T-bar position in OBS Studio Mode.",
     "set_mute": "Toggle, mute, or unmute an OBS audio input.",
-    "set_input_volume": "Set one OBS input's volume. A dial's $event.volume is 0.0 to 1.0, ending at 0 dB.",
+    "set_input_volume": "Move an OBS input volume relative to its current level. Every move stays within the configured minimum and maximum dB range.",
     "set_input_monitoring": "Toggle monitoring on/off, or choose Monitor Only or Monitor and Output explicitly.",
     "set_source_visibility": "Toggle, show, or hide one source in a scene.",
     "media_action": "Control playback for an OBS media input.",
@@ -77,7 +78,8 @@ def describe_action(action: ActionSpec) -> str:
     if kind == "set_mute":
         return f"{params.get('input', '')} - {params.get('mode', 'toggle').title()}"
     if kind == "set_input_volume":
-        return f"{params.get('input', '')} - {params.get('volume', '$event.volume')}"
+        return (f"{params.get('input', '')} - {params.get('step_db', 1)} dB/step, "
+                f"{params.get('min_db', -100)} to {params.get('max_db', 0)} dB")
     if kind == "set_input_monitoring":
         return f"{params.get('input', '')} - {params.get('mode', 'toggle').title()}"
     if kind == "set_source_visibility":
@@ -645,13 +647,15 @@ class LedRuleDialog(Modal):
         self.name = tk.StringVar(value=rule.name)
         self.panel = tk.StringVar(value=selected_panel)
         self.led = tk.StringVar(value=rule.led)
+        self.led_choices: dict[str, str] = {}
         self.condition = tk.StringVar(value=LED_CONDITIONS.get(rule.condition, rule.condition))
         self.target_a = tk.StringVar()
         self.target_b = tk.StringVar()
         self.invert = tk.BooleanVar(value=rule.invert)
 
         body = ttk.Frame(self.window, padding=18); body.pack(fill="both", expand=True)
-        for label, variable in (("Rule name", self.name), ("Panel", self.panel), ("Hardware LED", self.led)):
+        for label, variable in (("Rule name", self.name), ("Panel", self.panel),
+                                ("Hardware LED", self.led)):
             ttk.Label(body, text=label).pack(anchor="w")
             if variable is self.name:
                 widget = ttk.Entry(body, textvariable=variable)
@@ -681,6 +685,12 @@ class LedRuleDialog(Modal):
             style="Muted.TLabel",
         )
         self.rule_hint.pack(anchor="w", pady=(6, 0))
+        self.row_led_hint = ttk.Label(
+            body,
+            text="Entries use the physical label followed by the internal control name in brackets.",
+            style="Muted.TLabel", wraplength=570,
+        )
+        self.row_led_hint.pack(anchor="w", pady=(3, 0))
         footer = ttk.Frame(body, style="Card.TFrame"); footer.pack(side="bottom", fill="x")
         ttk.Button(footer, text="Cancel", command=self.window.destroy).pack(side="right")
         ttk.Button(footer, text="Save rule", style="Accent.TButton",
@@ -692,9 +702,16 @@ class LedRuleDialog(Modal):
         panel_id = self.panel_names.get(self.panel.get())
         panel = next((p for p in self.config.panels if p.id == panel_id), None)
         leds = led_control_names(panel.device_type) if panel else ()
-        self.led_box.configure(values=leds)
-        if self.led.get() not in leds and leds:
-            self.led.set(leds[0])
+        selected = self.led_choices.get(self.led.get(), self.rule.led)
+        self.led_choices = {display_control_name(led): led for led in leds}
+        labels = tuple(self.led_choices)
+        self.led_box.configure(values=labels)
+        matching_label = next((label for label, led in self.led_choices.items()
+                               if led == selected), None)
+        if matching_label:
+            self.led.set(matching_label)
+        elif labels:
+            self.led.set(labels[0])
 
     def _configure_condition(self, load=False):
         condition = self.condition_names.get(self.condition.get(), self.rule.condition)
@@ -767,7 +784,7 @@ class LedRuleDialog(Modal):
             return
         self.rule.name = self.name.get().strip()
         self.rule.panel_id = self.panel_names[self.panel.get()]
-        self.rule.led = self.led.get(); self.rule.condition = condition
+        self.rule.led = self.led_choices[self.led.get()]; self.rule.condition = condition
         self.rule.params = params; self.rule.invert = self.invert.get()
         self.result = True; self.window.destroy()
 
@@ -782,6 +799,7 @@ class MappingDialog(Modal):
         panel_names = {p.name: p.id for p in config.panels}; self.panel_names = panel_names
         selected_panel = next((name for name, pid in panel_names.items() if pid == mapping.panel_id), next(iter(panel_names)))
         self.panel = tk.StringVar(value=selected_panel); self.control = tk.StringVar(value=mapping.control)
+        self.control_choices: dict[str, str] = {}
         self.trigger = tk.StringVar(value=mapping.trigger)
 
         form = ttk.Frame(body, style="Card.TFrame"); form.pack(fill="x")
@@ -824,15 +842,23 @@ class MappingDialog(Modal):
         panel_id = self.panel_names.get(self.panel.get())
         panel = next((p for p in self.config.panels if p.id == panel_id), None)
         controls = input_control_names(panel.device_type) if panel else ()
-        self.control_box.configure(values=controls)
-        if self.control.get() not in controls and controls:
-            self.control.set(controls[0])
+        selected = self.control_choices.get(self.control.get(), self.mapping.control)
+        self.control_choices = {display_control_name(control): control for control in controls}
+        labels = tuple(self.control_choices)
+        self.control_box.configure(values=labels)
+        matching_label = next((label for label, control in self.control_choices.items()
+                               if control == selected), None)
+        if matching_label:
+            self.control.set(matching_label)
+        elif labels:
+            self.control.set(labels[0])
         self._update_triggers()
 
     def _update_triggers(self):
         panel_id = self.panel_names.get(self.panel.get())
         panel = next((p for p in self.config.panels if p.id == panel_id), None)
-        triggers = triggers_for_control(panel.device_type, self.control.get()) if panel else ()
+        control = self.control_choices.get(self.control.get(), self.control.get())
+        triggers = triggers_for_control(panel.device_type, control) if panel else ()
         self.trigger_box.configure(values=triggers)
         if self.trigger.get() not in triggers and triggers:
             self.trigger.set(triggers[0])
@@ -877,7 +903,8 @@ class MappingDialog(Modal):
             )
             return
         self.mapping.name = self.name.get().strip(); self.mapping.panel_id = self.panel_names[self.panel.get()]
-        self.mapping.control = self.control.get(); self.mapping.trigger = self.trigger.get(); self.mapping.actions = self.actions
+        self.mapping.control = self.control_choices[self.control.get()]
+        self.mapping.trigger = self.trigger.get(); self.mapping.actions = self.actions
         self.result = True; self.window.destroy()
 
 
@@ -998,7 +1025,7 @@ class ActionDialog(Modal):
         self.action, self.state = action, state
         self.reverse = {label: kind for kind, label in ACTION_LABELS.items()}
         self.kind = tk.StringVar(value=ACTION_LABELS.get(action.kind, action.kind))
-        self.values = [tk.StringVar() for _ in range(3)]
+        self.values = [tk.StringVar() for _ in range(4)]
         self.delay = tk.StringVar(value=str(action.delay_ms))
 
         body = ttk.Frame(self.window, padding=20); body.pack(fill="both", expand=True)
@@ -1092,8 +1119,12 @@ class ActionDialog(Modal):
                 self._field(1, "Mode", self.MODES,
                             self._choice(params.get("mode"), self.MODES, "toggle"))
             elif kind == "set_input_volume":
-                self._field(1, "Level (0-20; $event.volume = dial 0-1)",
-                            value=params.get("volume", "$event.volume"), editable=True)
+                self._field(1, "Step per dial tick (dB)",
+                            value=params.get("step_db", 1), editable=True)
+                self._field(2, "Minimum volume (dB)",
+                            value=params.get("min_db", -100), editable=True)
+                self._field(3, "Maximum volume (dB; 0 = unity gain)",
+                            value=params.get("max_db", 0), editable=True)
             elif kind == "set_input_monitoring":
                 self._field(1, "Monitoring mode", self.MONITORING_MODES,
                             self._choice(params.get("mode"), self.MONITORING_MODES, "toggle"))
@@ -1146,7 +1177,7 @@ class ActionDialog(Modal):
         try:
             delay = max(0, int(self.delay.get() or 0))
             kind = self.reverse[self.kind.get()]
-            a, b, c = (value.get() for value in self.values)
+            a, b, c, d = (value.get() for value in self.values)
             params = {}
             if kind in ("set_preview_scene", "set_program_scene"):
                 params["scene"] = self._required(a, "Scene")
@@ -1176,13 +1207,17 @@ class ActionDialog(Modal):
                 if kind == "set_mute":
                     params["mode"] = self._required(b, "Mode")
                 elif kind == "set_input_volume":
-                    volume = self._required(b, "Level")
-                    if volume != "$event.volume":
-                        numeric_volume = float(volume)
-                        if not 0 <= numeric_volume <= 20:
-                            raise ValueError("Level must be between 0 and 20.")
-                        volume = numeric_volume
-                    params["volume"] = volume
+                    step_db = float(self._required(b, "Step per dial tick"))
+                    min_db = float(self._required(c, "Minimum volume"))
+                    max_db = float(self._required(d, "Maximum volume"))
+                    if not 0.01 <= step_db <= 26:
+                        raise ValueError("Step per dial tick must be between 0.01 and 26 dB.")
+                    if not -100 <= min_db <= 26 or not -100 <= max_db <= 26:
+                        raise ValueError("Volume range must stay between -100 and 26 dB.")
+                    if min_db > max_db:
+                        raise ValueError("Minimum volume cannot be greater than maximum volume.")
+                    params.update(mode="relative", step_db=step_db,
+                                  min_db=min_db, max_db=max_db)
                 elif kind == "set_input_monitoring":
                     params["mode"] = self._required(b, "Monitoring mode")
                 else:

@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "obscontrol"
-version = "0.4.0"
+version = "0.5.1"
 description = "Desktop OBS controller for NewTek control surfaces"
 requires-python = ">=3.10"
 dependencies = [
-    "control-surfaces>=0.2.0",
+    "control-surfaces>=0.2.1",
     "websocket-client>=1.8",
     "pyserial>=3.5",
 ]

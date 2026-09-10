@@ -12,6 +12,7 @@ class FakeObs:
 
     def __init__(self):
         self.calls = []
+        self.volume_db = -6.0
 
     def call(self, request_type, data=None):
         self.calls.append((request_type, data))
@@ -21,6 +22,8 @@ class FakeObs:
             return {"currentPreviewSceneName": "Scene 2"}
         if request_type == "GetCurrentProgramScene":
             return {"currentProgramSceneName": "Scene 1"}
+        if request_type == "GetInputVolume":
+            return {"inputVolumeDb": self.volume_db}
         return {}
 
 
@@ -47,16 +50,17 @@ class MappingDispatchTests(unittest.TestCase):
             [("TriggerStudioModeTransition", None)],
         )
 
-    def test_dial_change_resolves_normalized_volume(self):
+    def test_dial_change_adjusts_volume_relative_to_current_level(self):
         mapping = Mapping(
             id="volume", panel_id="panel", control="SPEED", trigger="change",
             actions=[ActionSpec("set_input_volume", {
-                "input": "Mic", "volume": "$event.volume",
+                "input": "Mic", "mode": "relative", "step_db": 1, "max_db": 0,
             })],
         )
         engine = ControllerEngine(AppConfig(mappings=[mapping]))
         fake = FakeObs(); engine.obs = fake
         try:
+            engine._dial_values[("panel", "SPEED")] = 126
             engine._on_panel_event("panel", DialEvent("SPEED", 128))
             deadline = time.monotonic() + 1
             while not any(call[0] == "SetInputVolume" for call in fake.calls):
@@ -66,5 +70,5 @@ class MappingDispatchTests(unittest.TestCase):
         finally:
             engine._executor.shutdown(wait=True, cancel_futures=True)
         self.assertEqual(fake.calls[-1], (
-            "SetInputVolume", {"inputName": "Mic", "inputVolumeMul": 128 / 255},
+            "SetInputVolume", {"inputName": "Mic", "inputVolumeDb": -4.0},
         ))

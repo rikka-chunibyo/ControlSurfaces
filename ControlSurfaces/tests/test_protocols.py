@@ -63,12 +63,17 @@ class LC11FramingTests(unittest.TestCase):
         self.surface._dispatch('~4FFF')
         self.assertEqual(seen, [])
 
-    def test_auto_button_emits_press_and_release(self):
+    def test_auto_and_take_buttons_match_their_physical_action_contacts(self):
         seen = []
         self.surface.on_button(lambda event: seen.append((event.control, event.held)))
+        self.surface._dispatch('~3F7')
+        self.surface._dispatch('~3FF')
         self.surface._dispatch('~3FD')
         self.surface._dispatch('~3FF')
-        self.assertEqual(seen, [('AUTO', True), ('AUTO', False)])
+        self.assertEqual(seen, [
+            ('AUTO', True), ('AUTO', False),
+            ('TAKE', True), ('TAKE', False),
+        ])
 
     def test_isolated_endpoint_spikes_are_suppressed(self):
         seen = []

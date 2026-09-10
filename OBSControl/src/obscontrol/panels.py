@@ -33,6 +33,34 @@ def led_control_names(device_type: str) -> tuple[str, ...]:
                         if control.has_led))
 
 
+def display_control_name(name: str) -> str:
+    """Make driver names recognizable in GUI selectors without losing identity."""
+    transition_controls = {
+        "TBAR": "T-bar",
+        "TBAR_LED_TOP": "T-bar LED top",
+        "TBAR_LED_BOTTOM": "T-bar LED bottom",
+        "FADE": "Fade",
+        "FX_BUTTON": "FX",
+        "SPEED": "Speed dial",
+        "FX": "FX dial",
+        "FTB": "FTB",
+        "ALT": "Alt",
+        "FADE_ALL": "Fade all",
+        "TAKE_ALL": "Take all",
+        "AUTO": "Auto",
+        "TAKE": "Take",
+    }
+    if name in transition_controls:
+        return f"Transition — {transition_controls[name]} [{name}]"
+    parts = name.split("_", 1)
+    if len(parts) == 2 and parts[0] in {"EFFECTS", "LIVE", "PREVIEW"}:
+        row, control = parts
+        return f"{row.title()} row — {control.replace('DDR', 'DDR ')} [{name}]"
+    if name.endswith("_OVERLAY"):
+        return f"Overlay — {name[:-8].replace('DDR', 'DDR ')} [{name}]"
+    return f"{name.replace('_', ' ').replace('DDR', 'DDR ')} [{name}]"
+
+
 def triggers_for_control(device_type: str, name: str) -> tuple[str, ...]:
     control = control_catalog(device_type).get(name)
     if control is None:

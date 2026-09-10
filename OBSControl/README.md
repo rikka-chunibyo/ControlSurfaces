@@ -32,10 +32,15 @@ Configuration is saved to `%APPDATA%\OBSControl\config.json`.
 - **Transition current Preview (Studio Mode)** leaves the controller-selected
   Preview scene alone, selects only the transition, and takes Preview to Program.
 - `$event.position` passes the physical T-bar's normalized position to OBS.
-- `$event.volume` maps an LC-11 dial's 0--255 range to an OBS input's 0.0--1.0
-  volume multiplier. Map the same click-capable dial's `change` trigger to
-  **Input volume**, and its `press` trigger to **Input monitoring** with
-  `toggle` to get a compact volume/monitor strip.
+- **Input volume** uses a dial's signed movement relative to the current OBS
+  level. Choose a dB step size plus a minimum and maximum; the defaults are
+  -100 dB to 0 dB, so a dial cannot boost an input above unity gain. Map the
+  same click-capable dial's `change` trigger to **Input volume**, and its
+  `press` trigger to **Input monitoring** with `toggle` to get a compact
+  volume/monitor strip.
+- Control and LED selectors use physical groups: **Transition**, **Overlay**,
+  and the three **Effects / Live / Preview** rows. The saved configuration
+  retains the exact driver control name shown in brackets.
 - LED rules independently select a panel, any addressable LED, and an OBS
   condition. Multiple rules may target the same LED and are combined with OR.
 - LED conditions cover scenes, transitions, input mute, source visibility,

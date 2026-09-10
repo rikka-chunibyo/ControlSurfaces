@@ -91,13 +91,29 @@ def execute_action(client, action: ActionSpec, context: dict) -> None:
                 "inputName": params["input"], "inputMuted": mode == "on",
             })
     elif kind == "set_input_volume":
-        # OBS uses a multiplier: 1.0 is unity gain (0 dB) and 20.0 is its
-        # documented upper bound.  $event.volume is the LC-11 dial's
-        # normalized 0.0--1.0 position, so the normal mapping never boosts.
-        volume = max(0.0, min(20.0, float(params["volume"])))
-        client.call("SetInputVolume", {
-            "inputName": params["input"], "inputVolumeMul": volume,
-        })
+        if _is_relative_volume_action(action):
+            delta = float(context.get("delta") or 0)
+            if not delta:
+                return
+            step_db = float(params.get("step_db", 1.0))
+            min_db = float(params.get("min_db", -100.0))
+            max_db = float(params.get("max_db", 0.0))
+            if min_db > max_db:
+                raise ValueError("Input volume minimum cannot exceed its maximum")
+            current_db = float(client.call("GetInputVolume", {
+                "inputName": params["input"],
+            })["inputVolumeDb"])
+            client.call("SetInputVolume", {
+                "inputName": params["input"],
+                "inputVolumeDb": max(min_db, min(max_db, current_db + delta * step_db)),
+            })
+        else:
+            # Retain explicit numeric-volume actions saved by earlier versions.
+            multiplier = float(params.get("multiplier", 1.0))
+            volume = max(0.0, min(20.0, float(params["volume"]) * multiplier))
+            client.call("SetInputVolume", {
+                "inputName": params["input"], "inputVolumeMul": volume,
+            })
     elif kind == "set_input_monitoring":
         monitor_type = _monitor_type(client, params)
         client.call("SetInputAudioMonitorType", {
@@ -190,6 +206,14 @@ def _mode(params: dict, legacy_key: str | None = None) -> str:
     if legacy_key and legacy_key in params:
         return "on" if bool(params[legacy_key]) else "off"
     return "toggle"
+
+
+def _is_relative_volume_action(action: ActionSpec) -> bool:
+    """Use relative dB changes for new and previously saved dial mappings."""
+    mode = action.params.get("mode")
+    return mode == "relative" or (
+        mode is None and action.params.get("volume") == "$event.volume"
+    )
 
 
 def _monitor_type(client, params: dict) -> str:

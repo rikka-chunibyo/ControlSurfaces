@@ -8,6 +8,7 @@ class FakeObs:
     def __init__(self):
         self.calls = []
         self.monitor_type = "OBS_MONITORING_TYPE_NONE"
+        self.volume_db = -6.0
 
     def call(self, request_type, data=None):
         self.calls.append((request_type, data))
@@ -23,6 +24,8 @@ class FakeObs:
             return {"currentProgramSceneName": "Program"}
         if request_type == "GetInputAudioMonitorType":
             return {"monitorType": self.monitor_type}
+        if request_type == "GetInputVolume":
+            return {"inputVolumeDb": self.volume_db, "inputVolumeMul": 0.5}
         return {}
 
 
@@ -91,14 +94,49 @@ class ActionTests(unittest.TestCase):
             ("StartRecord", None),
         ])
 
-    def test_input_volume_uses_normalized_dial_value(self):
+    def test_input_volume_changes_current_level_by_relative_dial_steps(self):
         obs = FakeObs()
         execute_action(obs, ActionSpec("set_input_volume", {
-            "input": "Mic", "volume": "$event.volume",
-        }), {"volume": 128 / 255})
-        self.assertEqual(obs.calls, [(
-            "SetInputVolume", {"inputName": "Mic", "inputVolumeMul": 128 / 255},
-        )])
+            "input": "Mic", "mode": "relative", "step_db": 1.5, "max_db": 0,
+        }), {"delta": 2})
+        self.assertEqual(obs.calls, [
+            ("GetInputVolume", {"inputName": "Mic"}),
+            ("SetInputVolume", {"inputName": "Mic", "inputVolumeDb": -3.0}),
+        ])
+
+    def test_legacy_dial_volume_mapping_automatically_becomes_relative(self):
+        obs = FakeObs()
+        execute_action(obs, ActionSpec("set_input_volume", {
+            "input": "Mic", "volume": "$event.volume", "multiplier": 4,
+        }), {"delta": 2})
+        self.assertEqual(obs.calls[-1], (
+            "SetInputVolume", {"inputName": "Mic", "inputVolumeDb": -4.0},
+        ))
+
+    def test_input_volume_respects_the_configured_maximum(self):
+        obs = FakeObs(); obs.volume_db = -1.0
+        execute_action(obs, ActionSpec("set_input_volume", {
+            "input": "Mic", "mode": "relative", "step_db": 2, "min_db": -20, "max_db": 0,
+        }), {"delta": 1})
+        self.assertEqual(obs.calls[-1], (
+            "SetInputVolume", {"inputName": "Mic", "inputVolumeDb": 0.0},
+        ))
+
+    def test_input_volume_respects_the_configured_minimum(self):
+        obs = FakeObs(); obs.volume_db = -19.0
+        execute_action(obs, ActionSpec("set_input_volume", {
+            "input": "Mic", "mode": "relative", "step_db": 2, "min_db": -20, "max_db": 0,
+        }), {"delta": -1})
+        self.assertEqual(obs.calls[-1], (
+            "SetInputVolume", {"inputName": "Mic", "inputVolumeDb": -20.0},
+        ))
+
+    def test_input_volume_ignores_the_first_dial_position_without_a_delta(self):
+        obs = FakeObs()
+        execute_action(obs, ActionSpec("set_input_volume", {
+            "input": "Mic", "mode": "relative",
+        }), {"delta": 0})
+        self.assertEqual(obs.calls, [])
 
     def test_input_volume_is_limited_to_obs_range(self):
         obs = FakeObs()

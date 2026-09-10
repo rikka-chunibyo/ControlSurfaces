@@ -87,7 +87,9 @@ GROUP_CARET_1_BASELINE = 0xFF
 
 # ── '~3' group: action buttons + T-bar endpoint LEDs ──────────────────
 GROUP_TILDE_3_READ_BITS = {
-    'TAKE': 0x08, 'AUTO': 0x02,
+    # The LC-11's action contacts are active-low.  AUTO is the 0x08
+    # contact and TAKE is 0x02; these were previously labelled backwards.
+    'TAKE': 0x02, 'AUTO': 0x08,
     'FADE_ALL': 0x20, 'TAKE_ALL': 0x10,
     'FADE_OVERLAY': 0x80, 'TAKE_OVERLAY': 0x40,
 }
